@@ -2,14 +2,14 @@ const std = @import("std");
 const tls = @import("tls");
 
 const RecordingRandom = struct {
-    rand: std.rand.Random = .{
-        .fillFn = fillFn,
-    },
-    base: *std.rand.Random,
+    base: std.rand.Random,
     recorded: std.ArrayList(u8),
 
-    fn fillFn(r: *std.rand.Random, buf: []u8) void {
-        const self = @fieldParentPtr(@This(), "rand", r);
+    pub fn random(self: *RecordingRandom) std.rand.Random {
+        return std.rand.Random.init(self, fill);
+    }
+
+    fn fill(self: *RecordingRandom, buf: []u8) void {
         self.base.bytes(buf);
         self.recorded.writer().writeAll(buf) catch unreachable;
     }
@@ -41,7 +41,7 @@ fn RecordingReader(comptime Base: type) type {
 fn record_handshake(
     comptime ciphersuites: anytype,
     comptime curves: anytype,
-    allocator: *std.mem.Allocator,
+    allocator: std.mem.Allocator,
     out_name: []const u8,
     hostname: []const u8,
     port: u16,
@@ -51,7 +51,7 @@ fn record_handshake(
     const pem_file = try std.fs.cwd().openFile(pem_file_path, .{});
     defer pem_file.close();
 
-    const trust_anchors = try tls.x509.TrustAnchorChain.from_pem(allocator, pem_file.reader());
+    const trust_anchors = try tls.x509.CertificateChain.from_pem(allocator, pem_file.reader());
     defer trust_anchors.deinit();
     std.log.info("Read {} certificates.", .{trust_anchors.data.items.len});
 
@@ -65,7 +65,7 @@ fn record_handshake(
     defer recording_reader_state.recorded.deinit();
 
     var recording_random = RecordingRandom{
-        .base = std.crypto.random,
+        .base = std.crypto.random.*,
         .recorded = std.ArrayList(u8).init(allocator),
     };
     defer recording_random.recorded.deinit();
@@ -75,7 +75,7 @@ fn record_handshake(
     };
     std.log.info("Recording session `{s}`...", .{out_name});
     var client = try tls.client_connect(.{
-        .rand = &recording_random.rand,
+        .rand = recording_random.random(),
         .reader = reader,
         .writer = sock.writer(),
         .ciphersuites = ciphersuites,
@@ -115,7 +115,7 @@ fn record_handshake(
 
 fn record_with_ciphersuite(
     comptime ciphersuites: anytype,
-    allocator: *std.mem.Allocator,
+    allocator: std.mem.Allocator,
     out_name: []const u8,
     curve_str: []const u8,
     hostname: []const u8,
@@ -146,65 +146,65 @@ fn record_with_ciphersuite(
             );
         }
     }
-    std.log.crit("Invalid curve `{s}`", .{curve_str});
-    std.debug.warn("Available options:\n- all\n", .{});
+    std.log.err("Invalid curve `{s}`", .{curve_str});
+    std.debug.print("Available options:\n- all\n", .{});
     inline for (tls.curves.all) |curve| {
-        std.debug.warn("- {s}\n", .{curve.name});
+        std.debug.print("- {s}\n", .{curve.name});
     }
     return error.InvalidArg;
 }
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 pub fn main() !void {
-    const allocator = &gpa.allocator;
+    const allocator = gpa.allocator();
 
     var args = std.process.args();
     std.debug.assert(args.skip());
 
-    const pem_file_path = try (args.next(allocator) orelse {
-        std.log.crit("Need PEM file path as first argument", .{});
+    const pem_file_path = (try args.next(allocator)) orelse {
+        std.log.err("Need PEM file path as first argument", .{});
         return error.NotEnoughArgs;
-    });
+    };
     defer allocator.free(pem_file_path);
 
-    const ciphersuite_str = try (args.next(allocator) orelse {
-        std.log.crit("Need ciphersuite as second argument", .{});
+    const ciphersuite_str = (try args.next(allocator)) orelse {
+        std.log.err("Need ciphersuite as second argument", .{});
         return error.NotEnoughArgs;
-    });
+    };
     defer allocator.free(ciphersuite_str);
 
-    const curve_str = try (args.next(allocator) orelse {
-        std.log.crit("Need curve as third argument", .{});
+    const curve_str = (try args.next(allocator)) orelse {
+        std.log.err("Need curve as third argument", .{});
         return error.NotEnoughArgs;
-    });
+    };
     defer allocator.free(curve_str);
 
-    const hostname_port = try (args.next(allocator) orelse {
-        std.log.crit("Need hostname:port as fourth argument", .{});
+    const hostname_port = (try args.next(allocator)) orelse {
+        std.log.err("Need hostname:port as fourth argument", .{});
         return error.NotEnoughArgs;
-    });
+    };
     defer allocator.free(hostname_port);
 
     if (args.skip()) {
-        std.log.crit("Need exactly four arguments", .{});
+        std.log.err("Need exactly four arguments", .{});
         return error.TooManyArgs;
     }
 
-    var hostname_parts = std.mem.split(hostname_port, ":");
+    var hostname_parts = std.mem.split(u8, hostname_port, ":");
     const hostname = hostname_parts.next().?;
     const port = std.fmt.parseUnsigned(
         u16,
         hostname_parts.next() orelse {
-            std.log.crit("Hostname and port should be in `hostname:port` format", .{});
+            std.log.err("Hostname and port should be in `hostname:port` format", .{});
             return error.InvalidArg;
         },
         10,
     ) catch {
-        std.log.crit("Port is not a base 10 unsigned integer...", .{});
+        std.log.err("Port is not a base 10 unsigned integer...", .{});
         return error.InvalidArg;
     };
     if (hostname_parts.next() != null) {
-        std.log.crit("Hostname and port should be in `hostname:port` format", .{});
+        std.log.err("Hostname and port should be in `hostname:port` format", .{});
         return error.InvalidArg;
     }
 
@@ -240,10 +240,10 @@ pub fn main() !void {
             );
         }
     }
-    std.log.crit("Invalid ciphersuite `{s}`", .{ciphersuite_str});
-    std.debug.warn("Available options:\n- all\n", .{});
+    std.log.err("Invalid ciphersuite `{s}`", .{ciphersuite_str});
+    std.debug.print("Available options:\n- all\n", .{});
     inline for (tls.ciphersuites.all) |ciphersuite| {
-        std.debug.warn("- {s}\n", .{ciphersuite.name});
+        std.debug.print("- {s}\n", .{ciphersuite.name});
     }
     return error.InvalidArg;
 }

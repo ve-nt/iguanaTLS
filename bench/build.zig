@@ -11,10 +11,13 @@ pub fn build(b: *Builder) void {
         "use-gpa",
         "Use the general purpose allocator instead of an arena allocator",
     ) orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "use_gpa", use_gpa);
+
     const bench_build = b.addExecutable("bench", "bench.zig");
     bench_build.addPackagePath("tls", "../src/main.zig");
     bench_build.setBuildMode(.ReleaseFast);
-    bench_build.addBuildOption(bool, "use_gpa", use_gpa);
+    bench_build.addOptions("build_options", build_options);
     bench_build.install();
 
     const record_run_cmd = record_build.run();

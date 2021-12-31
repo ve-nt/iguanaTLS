@@ -12,23 +12,22 @@ const RecordingAllocator = struct {
         total_allocations: usize = 0,
     };
 
-    allocator: std.mem.Allocator = .{
-        .allocFn = allocFn,
-        .resizeFn = resizeFn,
-    },
-    base_allocator: *std.mem.Allocator,
+    base_allocator: std.mem.Allocator,
     stats: Stats = .{},
 
-    fn allocFn(
-        a: *std.mem.Allocator,
+    pub fn allocator(self: *RecordingAllocator) std.mem.Allocator {
+        return std.mem.Allocator.init(self, alloc, resize, free);
+    }
+
+    fn alloc(
+        a: *RecordingAllocator,
         len: usize,
         ptr_align: u29,
         len_align: u29,
         ret_addr: usize,
     ) ![]u8 {
-        const self = @fieldParentPtr(RecordingAllocator, "allocator", a);
-        const mem = try self.base_allocator.allocFn(
-            self.base_allocator,
+        const self = @ptrCast(*RecordingAllocator, a);
+        const mem = try self.base_allocator.rawAlloc(
             len,
             ptr_align,
             len_align,
@@ -44,21 +43,18 @@ const RecordingAllocator = struct {
         return mem;
     }
 
-    fn resizeFn(a: *std.mem.Allocator, buf: []u8, buf_align: u29, new_len: usize, len_align: u29, ret_addr: usize) !usize {
-        const self = @fieldParentPtr(RecordingAllocator, "allocator", a);
-        const actual_len = try self.base_allocator.resizeFn(
-            self.base_allocator,
+    fn resize(a: *RecordingAllocator, buf: []u8, buf_align: u29, new_len: usize, len_align: u29, ret_addr: usize) ?usize {
+        const self = @ptrCast(*RecordingAllocator, a);
+        const actual_len = self.base_allocator.rawResize(
             buf,
             buf_align,
             new_len,
             len_align,
             ret_addr,
-        );
+        ) orelse return null;
 
-        if (actual_len == 0) {
-            std.debug.assert(new_len == 0);
-            self.stats.total_deallocated += buf.len;
-        } else if (actual_len > buf.len) {
+        std.debug.assert(actual_len != 0);
+        if (actual_len > buf.len) {
             self.stats.total_allocated += actual_len - buf.len;
             self.stats.peak_allocated = std.math.max(
                 self.stats.peak_allocated,
@@ -68,6 +64,13 @@ const RecordingAllocator = struct {
             self.stats.total_deallocated += buf.len - actual_len;
         }
         return actual_len;
+    }
+
+    fn free(a: *RecordingAllocator, buf: []u8, buf_align: u29, return_address: usize) void {
+         _ = buf_align;
+         _ = return_address;
+        const self = @ptrCast(*RecordingAllocator, a);
+        self.stats.total_deallocated += buf.len;
     }
 };
 
@@ -94,11 +97,13 @@ const ReplayingReader = std.io.Reader(*ReplayingReaderState, error{}, struct {
 }.f);
 
 const ReplayingRandom = struct {
-    rand: std.rand.Random = .{ .fillFn = fillFn },
     data: []const u8,
 
-    fn fillFn(r: *std.rand.Random, buf: []u8) void {
-        const self = @fieldParentPtr(ReplayingRandom, "rand", r);
+    pub fn random(self: *ReplayingRandom) std.rand.Random {
+        return std.rand.Random.init(self, fillFn);
+    }
+
+    fn fillFn(self: *ReplayingRandom, buf: []u8) void {
         if (self.data.len < buf.len)
             @panic("Not enough random data!");
         std.mem.copy(u8, buf, self.data[0..buf.len]);
@@ -109,12 +114,11 @@ const ReplayingRandom = struct {
 fn benchmark_run(
     comptime ciphersuites: anytype,
     comptime curves: anytype,
-    gpa: *std.mem.Allocator,
-    allocator: *std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     running_time: f32,
     hostname: []const u8,
-    port: u16,
-    trust_anchors: tls.x509.TrustAnchorChain,
+    trust_anchors: tls.x509.CertificateChain,
     reader_recording: []const u8,
     random_recording: []const u8,
 ) !void {
@@ -126,7 +130,7 @@ fn benchmark_run(
         var warmup_time_passed: i128 = 0;
         var timer = try std.time.Timer.start();
         while (warmup_time_passed < warmup_time_ns) {
-            var rand = ReplayingRandom{
+            var rand_impl = ReplayingRandom{
                 .data = random_recording,
             };
             var reader_state = ReplayingReaderState{
@@ -137,7 +141,7 @@ fn benchmark_run(
 
             timer.reset();
             _ = try tls.client_connect(.{
-                .rand = &rand.rand,
+                .rand = rand_impl.random(),
                 .reader = reader,
                 .writer = writer,
                 .ciphersuites = ciphersuites,
@@ -165,7 +169,7 @@ fn benchmark_run(
         var iterations: usize = 0;
         var timer = try std.time.Timer.start();
         while (total_time_passed < bench_time_ns) : (iterations += 1) {
-            var rand = ReplayingRandom{
+            var rand_impl = ReplayingRandom{
                 .data = random_recording,
             };
             var reader_state = ReplayingReaderState{
@@ -177,13 +181,13 @@ fn benchmark_run(
 
             timer.reset();
             _ = try tls.client_connect(.{
-                .rand = &rand.rand,
+                .rand = rand_impl.random(),
                 .reader = reader,
                 .writer = writer,
                 .ciphersuites = ciphersuites,
                 .curves = curves,
                 .cert_verifier = .default,
-                .temp_allocator = &recording_allocator.allocator,
+                .temp_allocator = recording_allocator.allocator(),
                 .trusted_certificates = trust_anchors.data.items,
             }, hostname);
             const runtime = timer.read();
@@ -205,7 +209,8 @@ fn benchmark_run(
                 const dt = rec.time - mean_time_ns;
                 acc += dt * dt;
             }
-            break :blk std.math.sqrt(@divTrunc(acc, iterations));
+            const acc_unsigned: u128 = @intCast(u128, if (acc < 0) -acc else acc);
+            break :blk std.math.sqrt(@divTrunc(acc_unsigned, iterations));
         };
         const std_dev_ms = @intToFloat(f64, std_dev_ns) * std.time.ms_per_s / std.time.ns_per_s;
 
@@ -250,13 +255,13 @@ fn benchmark_run(
         }
 
         std.debug.print(
-            \\Peak allocated memory: {Bi:.2},
-            \\Total allocated memory: {Bi:.2},
+            \\Peak allocated memory: {:.2},
+            \\Total allocated memory: {:.2},
             \\Number of allocations: {d},
             \\
         , .{
-            first_mem_stats.peak_allocated,
-            first_mem_stats.total_allocated,
+            std.fmt.fmtIntSizeBin(first_mem_stats.peak_allocated),
+            std.fmt.fmtIntSizeBin(first_mem_stats.total_allocated),
             first_mem_stats.total_allocations,
         });
     }
@@ -265,12 +270,11 @@ fn benchmark_run(
 fn benchmark_run_with_ciphersuite(
     comptime ciphersuites: anytype,
     curve_str: []const u8,
-    gpa: *std.mem.Allocator,
-    allocator: *std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     running_time: f32,
     hostname: []const u8,
-    port: u16,
-    trust_anchors: tls.x509.TrustAnchorChain,
+    trust_anchors: tls.x509.CertificateChain,
     reader_recording: []const u8,
     random_recording: []const u8,
 ) !void {
@@ -282,7 +286,6 @@ fn benchmark_run_with_ciphersuite(
             allocator,
             running_time,
             hostname,
-            port,
             trust_anchors,
             reader_recording,
             random_recording,
@@ -297,7 +300,6 @@ fn benchmark_run_with_ciphersuite(
                 allocator,
                 running_time,
                 hostname,
-                port,
                 trust_anchors,
                 reader_recording,
                 random_recording,
@@ -309,23 +311,21 @@ fn benchmark_run_with_ciphersuite(
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = &gpa.allocator;
+    const allocator = gpa.allocator();
 
     var args = std.process.args();
     std.debug.assert(args.skip());
 
     const running_time = blk: {
-        const maybe_arg = args.next(allocator) orelse return error.NoArguments;
-        const arg = try maybe_arg;
+        const arg = (try args.next(allocator)) orelse return error.NoArguments;
         break :blk std.fmt.parseFloat(f32, arg) catch {
-            std.log.crit("Running time is not a floating point number...", .{});
+            std.log.err("Running time is not a floating point number...", .{});
             return error.InvalidArg;
         };
     };
 
     // Loop over all files, swap gpa with a fixed buffer allocator for the handhsake
-    arg_loop: while (args.next(allocator)) |recorded_file_path_or_err| {
-        const recorded_file_path = try recorded_file_path_or_err;
+    arg_loop: while (try args.next(allocator)) |recorded_file_path| {
         defer allocator.free(recorded_file_path);
 
         std.debug.print(
@@ -353,7 +353,8 @@ pub fn main() !void {
         defer allocator.free(hostname);
         try recorded_file.reader().readNoEof(hostname);
 
-        const port = try recorded_file.reader().readIntLittle(u16);
+        // This variable was passed around and unused, not sure why
+        //const port = try recorded_file.reader().readIntLittle(u16);
 
         const trust_anchors = blk: {
             const pem_file_path_len = try recorded_file.reader().readIntLittle(usize);
@@ -364,7 +365,7 @@ pub fn main() !void {
             const pem_file = try std.fs.cwd().openFile(pem_file_path, .{});
             defer pem_file.close();
 
-            const tas = try tls.x509.TrustAnchorChain.from_pem(allocator, pem_file.reader());
+            const tas = try tls.x509.CertificateChain.from_pem(allocator, pem_file.reader());
             std.debug.print("Read {} certificates.\n", .{tas.data.items.len});
             break :blk tas;
         };
@@ -380,13 +381,16 @@ pub fn main() !void {
         defer allocator.free(random_recording);
         try recorded_file.reader().readNoEof(random_recording);
 
-        const handshake_allocator = if (use_gpa)
-            &gpa.allocator
-        else
-            &std.heap.ArenaAllocator.init(std.heap.page_allocator).allocator;
+        var arena_allocator_impl: std.heap.ArenaAllocator = undefined;
+        const handshake_allocator = blk: {
+            if (use_gpa) break :blk gpa.allocator();
+            arena_allocator_impl = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            break :blk arena_allocator_impl.allocator();
+        };
 
         defer if (!use_gpa)
-            @fieldParentPtr(std.heap.ArenaAllocator, "allocator", handshake_allocator).deinit();
+            arena_allocator_impl.deinit();
+            //@fieldParentPtr(std.heap.ArenaAllocator, "allocator", handshake_allocator).deinit();
 
         if (std.mem.eql(u8, ciphersuite_str, "all")) {
             try benchmark_run_with_ciphersuite(
@@ -396,7 +400,6 @@ pub fn main() !void {
                 handshake_allocator,
                 running_time,
                 hostname,
-                port,
                 trust_anchors,
                 reader_recording,
                 random_recording,
@@ -412,7 +415,6 @@ pub fn main() !void {
                     handshake_allocator,
                     running_time,
                     hostname,
-                    port,
                     trust_anchors,
                     reader_recording,
                     random_recording,

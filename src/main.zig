@@ -218,7 +218,9 @@ fn CertificateReader(comptime Reader: type) type {
 
 pub const CertificateVerifier = union(enum) {
     none,
-    function: anytype,
+    // removed since anytype field is no longer supported.
+    // project still works without this so I think it must not be used internally
+    //function: anytype,
     default,
 };
 
@@ -250,11 +252,9 @@ pub fn ClientConnectError(
         PreMasterGenerationFailed,
         OutOfMemory,
     };
-    const err_msg = "Certificate verifier function cannot be generic, use CertificateVerifierReader to get the reader argument type";
+    //const err_msg = "Certificate verifier function cannot be generic, use CertificateVerifierReader to get the reader argument type";
     return Reader.Error || Writer.Error || ServerAlert || Additional || switch (verifier) {
         .none => error{},
-        .function => |f| @typeInfo(@typeInfo(@TypeOf(f)).Fn.return_type orelse
-            @compileError(err_msg)).ErrorUnion.error_set || error{CertificateVerificationFailed},
         .default => error{CertificateVerificationFailed},
     } || (if (has_client_certs) error{ClientCertificateVerifyFailed} else error{});
 }
@@ -1252,15 +1252,6 @@ pub fn client_connect(
                 hashing_reader,
                 certs_length,
             ),
-            .function => |f| {
-                var reader_state = CertificateReaderState(@TypeOf(hashing_reader)){
-                    .reader = hashing_reader,
-                    .length = certs_length,
-                };
-                var cert_reader = CertificateReader(@TypeOf(hashing_reader)){ .context = &reader_state };
-                certificate_public_key = try f(cert_reader);
-                try hashing_reader.skipBytes(reader_state.length - reader_state.idx, .{});
-            },
             .default => certificate_public_key = try default_cert_verifier(
                 options.temp_allocator,
                 hashing_reader,
